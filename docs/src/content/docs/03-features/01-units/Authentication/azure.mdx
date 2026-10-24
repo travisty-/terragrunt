@@ -58,6 +58,24 @@ terragrunt apply
 
 On AKS, the workload identity webhook injects `AZURE_FEDERATED_TOKEN_FILE`, which Terragrunt also accepts.
 
+In Azure Pipelines, set `ARM_ADO_PIPELINE_SERVICE_CONNECTION_ID` to the id of a workload identity federation service connection. Terragrunt then requests the token for that connection from `SYSTEM_OIDCREQUESTURI` with `SYSTEM_ACCESSTOKEN`, or from `ARM_OIDC_REQUEST_URL` with `ARM_OIDC_REQUEST_TOKEN`, the way the `azurerm` backend does, including when it reads dependency outputs straight from state. Azure Pipelines passes `System.AccessToken` to a step only when the step maps it, and issues the connection's token only to a stage with a task that references the connection:
+
+```yaml
+- task: AzureCLI@2
+  inputs:
+    azureSubscription: my-service-connection
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: terragrunt run --all plan
+  env:
+    ARM_SUBSCRIPTION_ID: 00000000-0000-0000-0000-000000000000
+    ARM_TENANT_ID: 00000000-0000-0000-0000-000000000000
+    ARM_CLIENT_ID: 00000000-0000-0000-0000-000000000000
+    ARM_USE_OIDC: true
+    ARM_ADO_PIPELINE_SERVICE_CONNECTION_ID: 00000000-0000-0000-0000-000000000000
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+```
+
 </Fragment>
 <Fragment slot="managed-identity">
 

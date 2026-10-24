@@ -66,6 +66,75 @@ func TestOIDCAssertionProvider_AzureDevOps(t *testing.T) {
 	assert.Equal(t, "assertion-jwt", assertion)
 }
 
+// TestOIDCAssertionProvider_AzureDevOpsServiceConnection verifies that a
+// service connection id selects the request the native backend's Azure DevOps
+// authorizer sends: a POST that adds the API version, the connection and the
+// audience only when the URL lacks them, read from oidcToken.
+func TestOIDCAssertionProvider_AzureDevOpsServiceConnection(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		env            map[string]string
+		wantConnection string
+		wantAuth       string
+	}{
+		{
+			name: "request url that already names the connection",
+			env: map[string]string{
+				"ARM_OIDC_REQUEST_URL":                   "https://tokens.example/oidc?serviceConnectionId=sc-url",
+				"ARM_OIDC_REQUEST_TOKEN":                 "request-token",
+				"ARM_ADO_PIPELINE_SERVICE_CONNECTION_ID": "sc-env",
+				"SYSTEM_OIDCREQUESTURI":                  "https://dev.azure.example/oidc",
+				"SYSTEM_ACCESSTOKEN":                     "job-token",
+			},
+			wantConnection: "sc-url",
+			wantAuth:       "Bearer request-token",
+		},
+		{
+			name: "pipeline request uri and the azapi connection variable",
+			env: map[string]string{
+				"ARM_OIDC_AZURE_SERVICE_CONNECTION_ID": "sc-env",
+				"SYSTEM_OIDCREQUESTURI":                "https://dev.azure.example/oidc",
+				"SYSTEM_ACCESSTOKEN":                   "job-token",
+			},
+			wantConnection: "sc-env",
+			wantAuth:       "Bearer job-token",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var (
+				gotMethod, gotAuth string
+				gotQuery           map[string][]string
+			)
+
+			v := oidcTestVenv(tt.env, func(_ context.Context, req *http.Request) (*http.Response, error) {
+				gotMethod = req.Method
+				gotAuth = req.Header.Get("Authorization")
+				gotQuery = req.URL.Query()
+
+				return oidcJSON(http.StatusOK, `{"oidcToken":"assertion-jwt"}`), nil
+			})
+
+			getAssertion := oidcAssertionProvider(v)
+			require.NotNil(t, getAssertion)
+
+			assertion, err := getAssertion(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, "assertion-jwt", assertion)
+			assert.Equal(t, http.MethodPost, gotMethod)
+			assert.Equal(t, tt.wantAuth, gotAuth)
+			assert.Equal(t, []string{tt.wantConnection}, gotQuery["serviceConnectionId"])
+			assert.Equal(t, []string{"7.1"}, gotQuery["api-version"])
+			assert.Equal(t, []string{oidcExchangeAudience}, gotQuery["audience"])
+		})
+	}
+}
+
 func TestOIDCAssertionProvider_MissingRequestToken(t *testing.T) {
 	t.Parallel()
 

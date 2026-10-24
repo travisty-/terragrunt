@@ -132,6 +132,17 @@ var azureUnsupportedEnvKeys = []string{
 	"SYSTEM_OIDCREQUESTURI",
 }
 
+// azureADOPipelineEnvKeys request a federated token for an Azure DevOps service connection, which azurehelper sends the way
+// the native backend's Azure DevOps authorizer does.
+var azureADOPipelineEnvKeys = []string{
+	"ARM_ADO_PIPELINE_SERVICE_CONNECTION_ID",
+	"ARM_OIDC_AZURE_SERVICE_CONNECTION_ID",
+	"ARM_OIDC_REQUEST_TOKEN",
+	"ARM_OIDC_REQUEST_URL",
+	"SYSTEM_ACCESSTOKEN",
+	"SYSTEM_OIDCREQUESTURI",
+}
+
 // azureManagedIdentityEnvKeys steer managed-identity discovery, which the in-process SDK reads from the Terragrunt process, not the venv.
 var azureManagedIdentityEnvKeys = []string{
 	"DEFAULT_IDENTITY_CLIENT_ID",
@@ -195,7 +206,9 @@ func azureDirectStateReadSupported(
 	}
 
 	env := v.Env
-	if !azureEnvSupported(v, pctx) {
+	adoPipeline := azureADOPipelineOIDC(config, env)
+
+	if !azureEnvSupported(v, pctx, azureADOPipelineAllowedEnvKeys(config, env, adoPipeline)) {
 		return false
 	}
 
@@ -227,7 +240,7 @@ func azureDirectStateReadSupported(
 		return false
 	}
 
-	return azureCredentialMethodSupported(toggles, creds, resourceGroup, tokenFile)
+	return azureCredentialMethodSupported(toggles, creds, resourceGroup, tokenFile, adoPipeline)
 }
 
 // azureBackendConfigSupported rejects config keys that are unknown, whitespace-padded, or handled only by the native backend.
@@ -254,8 +267,8 @@ func azureBackendConfigSupported(config backend.Config) bool {
 	return true
 }
 
-// azureEnvSupported rejects dependency environments azurehelper cannot mirror.
-func azureEnvSupported(v *venv.Venv, pctx *ParsingContext) bool {
+// azureEnvSupported rejects dependency environments azurehelper cannot mirror, apart from the unsupported keys in allowed.
+func azureEnvSupported(v *venv.Venv, pctx *ParsingContext, allowed []string) bool {
 	env := v.Env
 
 	if slices.ContainsFunc(azureSDKAmbientEnvKeys, pctx.dependencyOutputEnvOverridden) {
@@ -269,7 +282,7 @@ func azureEnvSupported(v *venv.Venv, pctx *ParsingContext) bool {
 	}
 
 	for _, key := range azureUnsupportedEnvKeys {
-		if env[key] != "" {
+		if env[key] != "" && !slices.Contains(allowed, key) {
 			return false
 		}
 	}
@@ -277,6 +290,46 @@ func azureEnvSupported(v *venv.Venv, pctx *ParsingContext) bool {
 	_, configured := env["AZURE_REGIONAL_AUTHORITY_NAME"]
 
 	return !configured
+}
+
+// azureADOPipelineOIDC reports whether Terraform, OpenTofu and azurehelper all authenticate through an Azure DevOps service
+// connection: OIDC is on, a connection, a request URL and a request token are set, and neither a static token nor a token
+// file is, since Terraform prefers those to the connection and OpenTofu and azurehelper do not.
+func azureADOPipelineOIDC(config backend.Config, env map[string]string) bool {
+	useOIDC := backendConfigBoolWithEnv(config, "use_oidc", env["ARM_USE_OIDC"])
+	if !useOIDC.valid || !useOIDC.value {
+		return false
+	}
+
+	if backendConfigValueSet(config, "oidc_token_file_path") ||
+		firstNonEmptyFromMap(env, "ARM_OIDC_TOKEN", "ARM_OIDC_TOKEN_FILE_PATH") != "" {
+		return false
+	}
+
+	return firstNonEmptyFromMap(env, "ARM_ADO_PIPELINE_SERVICE_CONNECTION_ID", "ARM_OIDC_AZURE_SERVICE_CONNECTION_ID") != "" &&
+		firstNonEmptyFromMap(env, "ARM_OIDC_REQUEST_URL", "SYSTEM_OIDCREQUESTURI") != "" &&
+		firstNonEmptyFromMap(env, "ARM_OIDC_REQUEST_TOKEN", "SYSTEM_ACCESSTOKEN") != ""
+}
+
+// azureADOPipelineAllowedEnvKeys returns the unsupported keys that an Azure DevOps service connection makes safe: its request
+// variables; the Azure SDK's token file, which the connection takes precedence over everywhere; and the Azure SDK's client
+// and tenant ids, which every implementation reads only when the ARM_* value is unset.
+func azureADOPipelineAllowedEnvKeys(config backend.Config, env map[string]string, adoPipeline bool) []string {
+	if !adoPipeline {
+		return nil
+	}
+
+	allowed := slices.Concat(azureADOPipelineEnvKeys, []string{"AZURE_FEDERATED_TOKEN_FILE"})
+
+	if clientID, valid := backendConfigStringWithEnv(config, "client_id", env, "ARM_CLIENT_ID"); valid && clientID != "" {
+		allowed = append(allowed, "AZURE_CLIENT_ID")
+	}
+
+	if tenantID, valid := backendConfigStringWithEnv(config, "tenant_id", env, "ARM_TENANT_ID"); valid && tenantID != "" {
+		allowed = append(allowed, "AZURE_TENANT_ID")
+	}
+
+	return allowed
 }
 
 // azureResolveAuthToggles rejects the auth switches azurehelper cannot honor and returns the ones later checks still need.
@@ -485,12 +538,13 @@ func azureCredentialMethodSupported(
 	creds *azureCredentials,
 	resourceGroup string,
 	tokenFile string,
+	adoPipeline bool,
 ) bool {
 	hasSharedKey := creds.accessKey != "" || creds.sasToken != ""
 	hasServicePrincipal := creds.clientID != "" && creds.clientSecret != "" && creds.tenantID != ""
 
 	if !hasSharedKey && !hasServicePrincipal &&
-		!azureTokenCredentialComplete(toggles, creds, tokenFile) {
+		!azureTokenCredentialComplete(toggles, creds, tokenFile, adoPipeline) {
 		return false
 	}
 
@@ -507,9 +561,10 @@ func azureTokenCredentialComplete(
 	toggles azureAuthToggles,
 	creds *azureCredentials,
 	tokenFile string,
+	adoPipeline bool,
 ) bool {
 	if toggles.useOIDC {
-		return tokenFile != "" && creds.clientID != "" && creds.tenantID != ""
+		return (tokenFile != "" || adoPipeline) && creds.clientID != "" && creds.tenantID != ""
 	}
 
 	// The native backend's remaining default is Azure CLI only, while azurehelper falls back to a broader credential chain.
